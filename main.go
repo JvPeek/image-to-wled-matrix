@@ -14,19 +14,66 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Hundemeier/go-sacn/sacn"
-	"golang.org/x/exp/rand"
+	//"github.com/Hundemeier/go-sacn/sacn" //completely broken do not use
+	"gitlab.com/patopest/go-sacn"
+	"gitlab.com/patopest/go-sacn/packet"
 	"golang.org/x/image/draw"
 )
 
+/*
+ TODO. problem für zukunfts-jan:
+
+- Multiframe-anzeige während konfigurierbarer dauer.
+*/
+
 type QueueApp struct {
-	queue []*gif.GIF
+	queue []FrameImage
 	mu    sync.RWMutex
 }
 
 func (a *QueueApp) returnError(w http.ResponseWriter, err error) {
 	w.WriteHeader(http.StatusInternalServerError)
 	w.Write([]byte(fmt.Sprintf("something went wrong: %s", err)))
+}
+
+type FrameImage struct {
+	Frames     []Frame
+	FrameTimes []int //anzeige dauer eines einzelnen frames
+}
+
+type Frame struct {
+	//r,g,b,a slice
+	Pixels []byte
+}
+
+func decodeImage(img image.Image) Frame {
+	resizedFrame := image.NewRGBA(
+		image.Rect(0, 0, 32, 32),
+	)
+
+	draw.NearestNeighbor.Scale(
+		resizedFrame,
+		resizedFrame.Bounds(),
+		img,
+		img.Bounds(),
+		draw.Over,
+		nil,
+	)
+
+	rect := resizedFrame.Bounds()
+	pixels := make([]byte, (rect.Max.X-rect.Min.X)*(rect.Max.Y-rect.Min.Y)*4)
+	index := 0
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			r, g, b, a := resizedFrame.At(x, y).RGBA()
+			pixels[index] = byte(r % 256)
+			pixels[index+1] = byte(g % 256)
+			pixels[index+2] = byte(b % 256)
+			pixels[index+3] = byte(a % 256)
+			index += 4
+		}
+	}
+	return Frame{pixels}
 }
 
 func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
@@ -52,70 +99,65 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 		imgReader := bytes.NewReader(imgData)
 
 		// den verwenden wir nun hier wie zuvor resp.Body
-		img, imgFormat, err := image.Decode(imgReader)
+		//eigentlich gehts hier nur ums format damit wir gif gesondert parsen können
+		_, imgFormat, err := image.Decode(imgReader)
 		if err != nil {
 			a.returnError(w, err)
 
 			return
 		}
 
-		// wenn es kein GIF ist, machen wir eins daraus
-		if imgFormat != "gif" {
-			var newImage bytes.Buffer
-			err = gif.Encode(&newImage, img, nil)
+		//decoding steps:
+		//1. decode image by type (gif with gifDecoder, png with pngDecoder etc)
+		//2. rescale to 32x32
+		//3. create new FrameImage von den image frames
+		/*Example:
+		rescaledGif := ...
+		framedImage := FrameImage{}
+		for _, image := range outputGIF.Image {
+			framedImage.Frames = append(framedImage.Frames, image)
+		}
+		*/
+		//triggert der auch bei mir??
+
+		//auf 0 zurückspulen
+		imgReader.Seek(0, io.SeekStart)
+
+		// wenn es ein GIF ist, decoden wir alle frames mit gif.DecodeAll(imgReader)
+		if imgFormat == "gif" {
+
+			//hier sind deine frames
+			inputGIF, err := gif.DecodeAll(imgReader)
+			if err != nil {
+				a.returnError(w, err)
+				return
+			}
+			//in inputGIF.Image liegen die frames
+
+			fmt.Printf("Anzahl der Frames:%v\n", len(inputGIF.Image))
+			frameImage := FrameImage{}
+			frameImage.FrameTimes = inputGIF.Delay
+			//40fps
+			//frameImage.FrameTime = (1000 / 40) * time.Millisecond
+			//for frame in gif frames:
+			//geht aber auch:
+			for _, img := range inputGIF.Image {
+				frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			}
+			//end for
+
+			a.queue = append(a.queue, frameImage)
+
+		} else {
+			//ansonsten
+			img, _, err := image.Decode(imgReader)
 			if err != nil {
 				a.returnError(w, err)
 			}
-
-			// und jetzt können wir ja einfach unsere imageDaten überschreiben
-
-			imgReader = bytes.NewReader(newImage.Bytes())
-
+			frameImage := FrameImage{}
+			frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			a.queue = append(a.queue, frameImage)
 		}
-
-		// jetzt spulen wir nochmal zurück, weil wir ja nicht auf 0 wären wenn es schon ein gif war
-		imgReader.Seek(0, io.SeekStart)
-
-		// hier ist unser Input ja jetzt immer ein GIF
-
-		inputGIF, err := gif.DecodeAll(imgReader)
-		if err != nil {
-			a.returnError(w, err)
-			return
-		}
-
-		newWidth := 32
-		newHeight := 32
-
-		outputGIF := &gif.GIF{
-			LoopCount: inputGIF.LoopCount,
-			Config: image.Config{
-				ColorModel: inputGIF.Config.ColorModel,
-				Width:      newWidth,
-				Height:     newHeight,
-			},
-		}
-
-		for i, frame := range inputGIF.Image {
-			resizedFrame := image.NewPaletted(
-				image.Rect(0, 0, newWidth, newHeight),
-				frame.Palette,
-			)
-
-			draw.NearestNeighbor.Scale(
-				resizedFrame,
-				resizedFrame.Bounds(),
-				frame,
-				frame.Bounds(),
-				draw.Over,
-				nil,
-			)
-
-			outputGIF.Image = append(outputGIF.Image, resizedFrame)
-			outputGIF.Delay = append(outputGIF.Delay, inputGIF.Delay[i])
-		}
-
-		a.queue = append(a.queue, outputGIF)
 	}
 
 	fmt.Fprint(w, "Image added")
@@ -132,12 +174,12 @@ func (a *QueueApp) handleShow(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	data := a.queue[0]
+	//data := a.queue[0]
 	//a.queue = a.queue[1:]
 
 	w.Header().Set("Content-Type", "image/gif")
 	// imaging.Encode(w, data, imaging.GIF)
-	gif.EncodeAll(w, data)
+	//gif.EncodeAll(w, data)
 
 }
 func (a *QueueApp) handleStat(w http.ResponseWriter, req *http.Request) {
@@ -154,14 +196,16 @@ func (a *QueueApp) Serve() error {
 }
 
 func (a *QueueApp) sendToArtnet() error {
+
+	opts := sacn.SenderOptions{ // Default for all packets sent by Sender if not provided in the packet itself.
+	}
 	//instead of "" you could provide an ip-address that the socket should bind to
-	trans, err := sacn.NewTransmitter("", [16]byte{1, 2, 3}, "test")
+	sender, err := sacn.NewSender("", &opts) // Create sender with binding to interface
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	// Map to store active channels
-	channels := make(map[uint16]chan<- []byte)
+	//universe_map := make(map[uint16]chan<- packet.SACNPacket)
 
 	// Activate each universe
 	//UNIVERSE ANZAHL DEFINITION HIER
@@ -169,36 +213,89 @@ func (a *QueueApp) sendToArtnet() error {
 	//HIER DRÜBER
 	//iterate over 0..universe-1
 
+	mapMutex := sync.Mutex{}
 	enableOutput := func() {
+		mapMutex.Lock()
+		defer mapMutex.Unlock()
+
 		fmt.Println("enabling output")
 		for i := range universes {
 			universe := i + 1 //universes are 1 indexed
-			if trans.IsActivated(universe) {
+			if sender.IsEnabled(universe) {
 				continue
 			}
-			ch, err := trans.Activate(universe)
+			_, err := sender.StartUniverse(universe)
 
 			if err != nil {
 				log.Fatalf("Failed to activate universe %d: %v", universe, err)
 			}
-			channels[universe] = ch
-			trans.SetDestinations(universe, []string{"192.168.2.90"})
+			sender.SetDestinations(universe, []string{"192.168.2.90"})
+			//hatten wir multicast?
+			//sender.SetMulticast(universe, true)
 		}
 	}
 	disableOutput := func() {
+		mapMutex.Lock()
+		defer mapMutex.Unlock()
+
 		fmt.Println("disabling output")
+
 		for i := range universes {
-			if ch := channels[i+1]; ch != nil {
-				close(ch)
-			}
+			sender.StopUniverse(i + 1)
 		}
 	}
 
 	displayImage := func() {
 		a.mu.Lock()
 		//get image data
-		// data := a.queue[0]
+		image := a.queue[0]
 		a.queue = a.queue[1:]
+		frames := image.Frames
+		//frame0Indices := frames[0].Pix
+
+		//1. get current image
+		//loop for 10 seconds
+		//get current frame
+		//TODO iterate over frames
+		//TODO move display into displayFrame(frame, frameDisplayTime) method
+		frame := frames[0]
+		maxPos := len(frame.Pixels)
+		pixels_per_universe := 170
+		for i := range universes {
+			universe := i + 1
+			data := [510]byte{}
+			for j := range pixels_per_universe {
+				//0 ist der 0/1te frame
+				pos := (int(i)*pixels_per_universe + j) * 4
+				if pos >= maxPos {
+					break
+				}
+				//frameColor0 := frames[0].Palette[frame0Indices[int(i)*pixels_per_universe+j]]
+				//fmt.Printf("PixelIndex: %v\n", int(i)*pixels_per_universe+j)
+				ir := frame.Pixels[pos]
+				ig := frame.Pixels[pos+1]
+				ib := frame.Pixels[pos+2]
+				ia := frame.Pixels[pos+3]
+				ia = ia / 255.0
+				data[j*3] = byte(ir * ia)
+				data[j*3+1] = byte(ig * ia)
+				data[j*3+2] = byte(ib * ia)
+
+			}
+
+			// for i := range 510 {
+			// 	data[i] = byte(rand.Intn(2) * 255) // Channel 1
+
+			// }
+
+			// Send the data
+			p := packet.NewDataPacket()
+			p.SetData(data[:])
+			sender.Send(universe, p)
+
+			log.Printf("Sent data to Universe %d", universe)
+		}
+
 		a.mu.Unlock()
 		//actual send
 		//for range data or so send one frame
@@ -206,7 +303,6 @@ func (a *QueueApp) sendToArtnet() error {
 
 	for {
 		if len(a.queue) == 0 {
-			disableOutput()
 			time.Sleep(1000 * time.Millisecond)
 			continue
 		}
@@ -214,23 +310,12 @@ func (a *QueueApp) sendToArtnet() error {
 		enableOutput()
 
 		displayImage()
-		//1. get current image
-		//loop for 10 seconds
-		//get current frame
-		for universe, ch := range channels {
-			data := [510]byte{}
-
-			for i := range 510 {
-				data[i] = byte(rand.Intn(2) * 255) // Channel 1
-
-			}
-			// Send the data
-			ch <- data[:]
-
-			log.Printf("Sent data to Universe %d", universe)
-		}
 
 		time.Sleep(10000 * time.Millisecond)
+		if len(a.queue) == 0 && false {
+			disableOutput()
+		}
+		time.Sleep(1000 * time.Millisecond)
 	}
 }
 
