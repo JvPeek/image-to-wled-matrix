@@ -18,6 +18,9 @@ import (
 	"gitlab.com/patopest/go-sacn"
 	"gitlab.com/patopest/go-sacn/packet"
 	"golang.org/x/image/draw"
+
+	//_ "golang.org/x/image/webp"
+	"github.com/gen2brain/webp"
 )
 
 /*
@@ -91,7 +94,7 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 		imgData, err := io.ReadAll(resp.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(fmt.Sprintf("something went wrong: %s", err)))
+			w.Write([]byte(fmt.Sprintf("something went wrong: %s %s", err, resp.Body)))
 			return
 		}
 
@@ -100,7 +103,8 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 
 		// den verwenden wir nun hier wie zuvor resp.Body
 		//eigentlich gehts hier nur ums format damit wir gif gesondert parsen können
-		_, imgFormat, err := image.Decode(imgReader)
+		conf, imgFormat, err := image.DecodeConfig(imgReader)
+		fmt.Printf("Image format: %v %v\n", imgFormat, conf)
 		if err != nil {
 			a.returnError(w, err)
 
@@ -122,7 +126,6 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 
 		//auf 0 zurückspulen
 		imgReader.Seek(0, io.SeekStart)
-
 		// wenn es ein GIF ist, decoden wir alle frames mit gif.DecodeAll(imgReader)
 		if imgFormat == "gif" {
 
@@ -134,9 +137,12 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 			}
 			//in inputGIF.Image liegen die frames
 
-			fmt.Printf("Anzahl der Frames:%v\n", len(inputGIF.Image))
+			fmt.Printf("GIF Anzahl der Frames:%v\n", len(inputGIF.Image))
 			frameImage := FrameImage{}
 			frameImage.FrameTimes = inputGIF.Delay
+			for index, time := range frameImage.FrameTimes {
+				frameImage.FrameTimes[index] = time * 10
+			}
 			//40fps
 			//frameImage.FrameTime = (1000 / 40) * time.Millisecond
 			//for frame in gif frames:
@@ -148,6 +154,23 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 
 			a.queue = append(a.queue, frameImage)
 
+		} else if imgFormat == "webp" {
+			if false {
+				fmt.Println("webp decode broken atm, come back later")
+				return
+			}
+			frameImage := FrameImage{}
+			webp, err := webp.DecodeAll(imgReader)
+			//send error if first decode fails
+			if err != nil {
+				a.returnError(w, err)
+			}
+			for _, img := range webp.Image {
+				frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			}
+			frameImage.FrameTimes = webp.Delay
+			fmt.Printf("WEBP Anzahl der Frames:%v\n", len(frameImage.Frames))
+			a.queue = append(a.queue, frameImage)
 		} else {
 			//ansonsten
 			img, _, err := image.Decode(imgReader)
@@ -156,6 +179,7 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 			}
 			frameImage := FrameImage{}
 			frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			frameImage.FrameTimes = []int{500}
 			a.queue = append(a.queue, frameImage)
 		}
 	}
@@ -244,21 +268,16 @@ func (a *QueueApp) sendToArtnet() error {
 			sender.StopUniverse(i + 1)
 		}
 	}
+	enableOutput()
+	defer disableOutput()
 
-	displayImage := func() {
-		a.mu.Lock()
-		//get image data
-		image := a.queue[0]
-		a.queue = a.queue[1:]
-		frames := image.Frames
-		//frame0Indices := frames[0].Pix
-
-		//1. get current image
-		//loop for 10 seconds
-		//get current frame
-		//TODO iterate over frames
-		//TODO move display into displayFrame(frame, frameDisplayTime) method
-		frame := frames[0]
+	/*
+		Display Strategie:
+		call displayImage
+		for frame: call displayFrame
+		wait frameTime or x ms if single frame
+	*/
+	displaySingleFrame := func(frame Frame) {
 		maxPos := len(frame.Pixels)
 		pixels_per_universe := 170
 		for i := range universes {
@@ -296,7 +315,35 @@ func (a *QueueApp) sendToArtnet() error {
 			log.Printf("Sent data to Universe %d", universe)
 		}
 
+	}
+	displayImage := func() {
+		a.mu.Lock()
+		//get image data
+		image := a.queue[0]
+		a.queue = a.queue[1:]
+		frames := image.Frames
 		a.mu.Unlock()
+		//frame0Indices := frames[0].Pix
+
+		//1. get current image
+
+		//TODO loop for 10 seconds
+		timeNow := time.Now()
+
+		timeEnd := timeNow.Add(time.Second * 10)
+
+	endloop:
+		for {
+			for index, frame := range frames {
+				displaySingleFrame(frame)
+				time.Sleep(time.Duration(image.FrameTimes[index]) * time.Millisecond)
+				if time.Now().Unix() > timeEnd.Unix() {
+					break endloop
+				}
+			}
+
+		}
+
 		//actual send
 		//for range data or so send one frame
 	}
@@ -307,14 +354,17 @@ func (a *QueueApp) sendToArtnet() error {
 			continue
 		}
 
-		enableOutput()
+		//enableOutput()
 
 		displayImage()
 
-		time.Sleep(10000 * time.Millisecond)
+		//no 10sek sleep between images
+		//time.Sleep(10000 * time.Millisecond)
+		/* output gets disabled via defer aka on exit
 		if len(a.queue) == 0 && false {
 			disableOutput()
 		}
+		*/
 		time.Sleep(1000 * time.Millisecond)
 	}
 }
