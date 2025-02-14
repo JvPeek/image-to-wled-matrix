@@ -328,20 +328,19 @@ func (a *QueueApp) sendToArtnet() error {
 		//1. get current image
 
 		//TODO loop for 10 seconds
-		timeNow := time.Now()
 
-		timeEnd := timeNow.Add(time.Second * 10)
+		sleptTime := 0
 
 	endloop:
 		for {
 			for index, frame := range frames {
 				displaySingleFrame(frame)
 				time.Sleep(time.Duration(image.FrameTimes[index]) * time.Millisecond)
-				if time.Now().Unix() > timeEnd.Unix() {
+				sleptTime += image.FrameTimes[index]
+				if sleptTime >= 10_000 {
 					break endloop
 				}
 			}
-
 		}
 
 		//actual send
