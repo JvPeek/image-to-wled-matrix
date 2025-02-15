@@ -9,6 +9,10 @@ import (
 	_ "image/png"
 	"io"
 	"log"
+	"math"
+	"net"
+	"os"
+	"strconv"
 
 	"net/http"
 	"sync"
@@ -21,6 +25,7 @@ import (
 
 	//_ "golang.org/x/image/webp"
 	"github.com/gen2brain/webp"
+	"github.com/joho/godotenv"
 )
 
 /*
@@ -48,10 +53,18 @@ type Frame struct {
 	//r,g,b,a slice
 	Pixels []byte
 }
+type Config struct {
+	RES_H       int
+	RES_V       int
+	TARGET_IP   string
+	SOURCE_PORT int
+}
+
+var config Config
 
 func decodeImage(img image.Image, bounds image.Rectangle) Frame {
 	resizedFrame := image.NewRGBA(
-		image.Rect(0, 0, 32, 32),
+		image.Rect(0, 0, config.RES_H, config.RES_V),
 	)
 
 	draw.NearestNeighbor.Scale(
@@ -144,9 +157,10 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 			frameImage.FrameTimes = inputGIF.Delay
 			for index, time := range frameImage.FrameTimes {
 				frameImage.FrameTimes[index] = time * 10
+				if frameImage.FrameTimes[index] < 10 {
+					frameImage.FrameTimes[index] = 10
+				}
 			}
-			//40fps
-			//frameImage.FrameTime = (1000 / 40) * time.Millisecond
 			//for frame in gif frames:
 			//geht aber auch:
 			for i, img := range inputGIF.Image {
@@ -181,6 +195,11 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 				frameImage.Frames = append(frameImage.Frames, decodeImage(img, bounds))
 			}
 			frameImage.FrameTimes = webp.Delay
+			for index, time := range frameImage.FrameTimes {
+				if time < 10 {
+					frameImage.FrameTimes[index] = 10
+				}
+			}
 			fmt.Printf("WEBP Anzahl der Frames:%v\n", len(frameImage.Frames))
 			a.queue = append(a.queue, frameImage)
 		} else {
@@ -227,7 +246,7 @@ func (a *QueueApp) Serve() error {
 	http.HandleFunc("/show", a.handleShow)
 	http.HandleFunc("/stat", a.handleStat)
 
-	err := http.ListenAndServe(":8090", nil)
+	err := http.ListenAndServe(":"+strconv.Itoa(config.SOURCE_PORT), nil)
 	return err
 }
 
@@ -245,7 +264,10 @@ func (a *QueueApp) sendToArtnet() error {
 
 	// Activate each universe
 	//UNIVERSE ANZAHL DEFINITION HIER
-	var universes uint16 = 7
+	pix_per_universes := 170.0
+	pixels := float64(config.RES_H * config.RES_V)
+
+	var universes uint16 = uint16(math.Ceil(pixels / pix_per_universes))
 	//HIER DRÜBER
 	//iterate over 0..universe-1
 
@@ -265,7 +287,7 @@ func (a *QueueApp) sendToArtnet() error {
 			if err != nil {
 				log.Fatalf("Failed to activate universe %d: %v", universe, err)
 			}
-			sender.SetDestinations(universe, []string{"192.168.2.90"})
+			sender.SetDestinations(universe, []string{config.TARGET_IP})
 			//hatten wir multicast?
 			//sender.SetMulticast(universe, true)
 		}
@@ -365,22 +387,63 @@ func (a *QueueApp) sendToArtnet() error {
 			continue
 		}
 
-		//enableOutput()
+		enableOutput()
 
 		displayImage()
 
 		//no 10sek sleep between images
 		//time.Sleep(10000 * time.Millisecond)
 		/* output gets disabled via defer aka on exit
-		if len(a.queue) == 0 && false {
+		 */
+		if len(a.queue) == 0 {
 			disableOutput()
 		}
-		*/
 		time.Sleep(1000 * time.Millisecond)
 	}
 }
+func checkConfig() Config {
 
+	thisConfig := Config{}
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println(".env file not loaded")
+	}
+
+	RES_H, err := strconv.Atoi(os.Getenv("RES_H"))
+	if err != nil {
+		// ... handle error
+		panic(err)
+	}
+	RES_V, err := strconv.Atoi(os.Getenv("RES_V"))
+	if err != nil {
+		// ... handle error
+		panic(err)
+	}
+	thisConfig.RES_H = RES_H
+	thisConfig.RES_V = RES_V
+
+	TARGET_IP := os.Getenv("TARGET_IP")
+	if net.ParseIP(TARGET_IP) == nil {
+		panic("not a valid IP address")
+	}
+	thisConfig.TARGET_IP = TARGET_IP
+
+	SOURCE_PORT, err := strconv.Atoi(os.Getenv("SOURCE_PORT"))
+	if err != nil {
+		// ... handle error
+		panic(err)
+	}
+	if SOURCE_PORT > 65535 || SOURCE_PORT < 1 {
+		panic("not a valid port number")
+	}
+	thisConfig.SOURCE_PORT = SOURCE_PORT
+	fmt.Printf("RES_H: %v, RESV: %v\nTARGET_IP: %v\nSOURCE_PORT: %v\n", RES_H, RES_V, TARGET_IP, SOURCE_PORT)
+
+	return thisConfig
+}
 func main() {
+
+	config = checkConfig()
 	app := &QueueApp{}
 
 	go app.sendToArtnet()
