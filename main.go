@@ -49,7 +49,7 @@ type Frame struct {
 	Pixels []byte
 }
 
-func decodeImage(img image.Image) Frame {
+func decodeImage(img image.Image, bounds image.Rectangle) Frame {
 	resizedFrame := image.NewRGBA(
 		image.Rect(0, 0, 32, 32),
 	)
@@ -58,7 +58,7 @@ func decodeImage(img image.Image) Frame {
 		resizedFrame,
 		resizedFrame.Bounds(),
 		img,
-		img.Bounds(),
+		bounds,
 		draw.Over,
 		nil,
 	)
@@ -127,6 +127,7 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 		//auf 0 zurückspulen
 		imgReader.Seek(0, io.SeekStart)
 		// wenn es ein GIF ist, decoden wir alle frames mit gif.DecodeAll(imgReader)
+		bounds := image.Rect(0, 0, conf.Width, conf.Height)
 		if imgFormat == "gif" {
 
 			//hier sind deine frames
@@ -135,6 +136,7 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 				a.returnError(w, err)
 				return
 			}
+			//bounds := inputGIF.Image[0].Bounds()
 			//in inputGIF.Image liegen die frames
 
 			fmt.Printf("GIF Anzahl der Frames:%v\n", len(inputGIF.Image))
@@ -147,8 +149,17 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 			//frameImage.FrameTime = (1000 / 40) * time.Millisecond
 			//for frame in gif frames:
 			//geht aber auch:
-			for _, img := range inputGIF.Image {
-				frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			for i, img := range inputGIF.Image {
+				fmt.Printf("Decoding GIF Frame: %v with size: %v vs %v\n", i, img.Bounds(), bounds)
+				if inputGIF.Disposal[i] == gif.DisposalNone && i > 0 {
+					combinedBounds := inputGIF.Image[i-1].Bounds().Union(img.Bounds())
+					tempImg := image.NewPaletted(combinedBounds, img.Palette)
+					draw.Copy(tempImg, inputGIF.Image[i-1].Bounds().Min, inputGIF.Image[i-1], inputGIF.Image[i-1].Bounds(), draw.Src, nil)
+					draw.Copy(tempImg, img.Bounds().Min, img, img.Bounds(), draw.Src, nil)
+					inputGIF.Image[i] = tempImg
+					img = tempImg
+				}
+				frameImage.Frames = append(frameImage.Frames, decodeImage(img, bounds))
 			}
 			//end for
 
@@ -165,8 +176,9 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 			if err != nil {
 				a.returnError(w, err)
 			}
+			//bounds := webp.Image[0].Bounds()
 			for _, img := range webp.Image {
-				frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+				frameImage.Frames = append(frameImage.Frames, decodeImage(img, bounds))
 			}
 			frameImage.FrameTimes = webp.Delay
 			fmt.Printf("WEBP Anzahl der Frames:%v\n", len(frameImage.Frames))
@@ -178,7 +190,7 @@ func (a *QueueApp) handleAdd(w http.ResponseWriter, req *http.Request) {
 				a.returnError(w, err)
 			}
 			frameImage := FrameImage{}
-			frameImage.Frames = append(frameImage.Frames, decodeImage(img))
+			frameImage.Frames = append(frameImage.Frames, decodeImage(img, bounds))
 			frameImage.FrameTimes = []int{500}
 			a.queue = append(a.queue, frameImage)
 		}
